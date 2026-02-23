@@ -99,7 +99,7 @@ static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE ("src",
 #define gst_my_filter_parent_class parent_class
 G_DEFINE_TYPE (GstMyFilter, gst_my_filter, GST_TYPE_ELEMENT);
 
-GST_ELEMENT_REGISTER_DEFINE (my_filter, "my_filter", GST_RANK_NONE,
+GST_ELEMENT_REGISTER_DEFINE (my_filter, "myfilter", GST_RANK_NONE,
     GST_TYPE_MYFILTER);
 
 static void gst_my_filter_set_property (GObject * object,
@@ -282,6 +282,6 @@ myfilter_init (GstPlugin * myfilter)
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
     myfilter,
-    "my_filter",
+    "myfilter",
     myfilter_init,
     PACKAGE_VERSION, GST_LICENSE, GST_PACKAGE_NAME, GST_PACKAGE_ORIGIN)
