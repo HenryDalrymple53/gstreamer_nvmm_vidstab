@@ -84,17 +84,32 @@ enum
  *
  * describe the real formats here.
  */
-static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
+
+static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE (
+    "sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("ANY")
-    );
+    GST_STATIC_CAPS (
+        "video/x-raw(memory:NVMM), "
+        "format = (string) NV12, "
+        "width = (int) [ 1, 32767 ], "
+        "height = (int) [ 1, 32767 ], "
+        "framerate = (fraction) [ 0/1, 2147483647/1 ]"
+    )
+);
 
-static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE ("src",
+static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE (
+    "src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("ANY")
-    );
+    GST_STATIC_CAPS (
+        "video/x-raw(memory:NVMM), "
+        "format = (string) NV12, "
+        "width = (int) [ 1, 32767 ], "
+        "height = (int) [ 1, 32767 ], "
+        "framerate = (fraction) [ 0/1, 2147483647/1 ]"
+    )
+);
 
 #define gst_my_filter_parent_class parent_class
 G_DEFINE_TYPE (GstMyFilter, gst_my_filter, GST_TYPE_ELEMENT);
