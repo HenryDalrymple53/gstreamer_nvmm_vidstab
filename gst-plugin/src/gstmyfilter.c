@@ -1,76 +1,15 @@
-/*
- * GStreamer
- * Copyright (C) 2005 Thomas Vander Stichele <thomas@apestaart.org>
- * Copyright (C) 2005 Ronald S. Bultje <rbultje@ronald.bitfreak.net>
- * Copyright (C) 2026 henry <<user@hostname.org>>
- * 
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- *
- * Alternatively, the contents of this file may be used under the
- * GNU Lesser General Public License Version 2.1 (the "LGPL"), in
- * which case the following provisions apply instead of the ones
- * mentioned above:
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Library General Public
- * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Library General Public License for more details.
- *
- * You should have received a copy of the GNU Library General Public
- * License along with this library; if not, write to the
- * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
- * Boston, MA 02111-1307, USA.
- */
-
-/**
- * SECTION:element-myfilter
- *
- * FIXME:Describe myfilter here.
- *
- * <refsect2>
- * <title>Example launch line</title>
- * |[
- * gst-launch -v -m fakesrc ! myfilter ! fakesink silent=TRUE
- * ]|
- * </refsect2>
- */
-
 #ifdef HAVE_CONFIG_H
 #  include <config.h>
 #endif
 
 #include <gst/gst.h>
-
 #include "gstmyfilter.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_my_filter_debug);
 #define GST_CAT_DEFAULT gst_my_filter_debug
 
-/* Filter signals and args */
 enum
 {
-  /* FILL ME */
   LAST_SIGNAL
 };
 
@@ -79,11 +18,6 @@ enum
   PROP_0,
   PROP_SILENT
 };
-
-/* the capabilities of the inputs and outputs.
- *
- * describe the real formats here.
- */
 
 static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE (
     "sink",
@@ -121,35 +55,31 @@ static void gst_my_filter_set_property (GObject * object,
     guint prop_id, const GValue * value, GParamSpec * pspec);
 static void gst_my_filter_get_property (GObject * object,
     guint prop_id, GValue * value, GParamSpec * pspec);
-
+static void gst_my_filter_finalize (GObject * object);
 static gboolean gst_my_filter_sink_event (GstPad * pad,
     GstObject * parent, GstEvent * event);
 static GstFlowReturn gst_my_filter_chain (GstPad * pad,
     GstObject * parent, GstBuffer * buf);
 
-/* GObject vmethod implementations */
+/* ── class init ──────────────────────────────────────────────────────────── */
 
-/* initialize the myfilter's class */
 static void
 gst_my_filter_class_init (GstMyFilterClass * klass)
 {
-  GObjectClass *gobject_class;
-  GstElementClass *gstelement_class;
-
-  gobject_class = (GObjectClass *) klass;
-  gstelement_class = (GstElementClass *) klass;
+  GObjectClass *gobject_class = (GObjectClass *) klass;
+  GstElementClass *gstelement_class = (GstElementClass *) klass;
 
   gobject_class->set_property = gst_my_filter_set_property;
   gobject_class->get_property = gst_my_filter_get_property;
+  gobject_class->finalize     = gst_my_filter_finalize;
 
   g_object_class_install_property (gobject_class, PROP_SILENT,
       g_param_spec_boolean ("silent", "Silent", "Produce verbose output ?",
           FALSE, G_PARAM_READWRITE));
 
   gst_element_class_set_details_simple (gstelement_class,
-      "MyFilter",
-      "FIXME:Generic",
-      "FIXME:Generic Template Element", "henry <<user@hostname.org>>");
+      "MyFilter", "Video/Filter",
+      "Low-latency VPI video stabilisation", "henry <<user@hostname.org>>");
 
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&src_factory));
@@ -157,11 +87,8 @@ gst_my_filter_class_init (GstMyFilterClass * klass)
       gst_static_pad_template_get (&sink_factory));
 }
 
-/* initialize the new element
- * instantiate pads and add them to element
- * set pad callback functions
- * initialize instance structure
- */
+/* ── instance init ───────────────────────────────────────────────────────── */
+
 static void
 gst_my_filter_init (GstMyFilter * filter)
 {
@@ -177,7 +104,82 @@ gst_my_filter_init (GstMyFilter * filter)
   GST_PAD_SET_PROXY_CAPS (filter->srcpad);
   gst_element_add_pad (GST_ELEMENT (filter), filter->srcpad);
 
-  filter->silent = FALSE;
+  filter->silent          = FALSE;
+  filter->vpi_initialized = FALSE;
+  filter->width           = 0;
+  filter->height          = 0;
+  filter->vpi_stream      = NULL;
+  filter->pyrPrevFrame    = NULL;
+  filter->pyrCurFrame     = NULL;
+  filter->arrPrevPts      = NULL;
+  filter->arrCurPts       = NULL;
+  filter->arrStatus       = NULL;
+  filter->optflow         = NULL;
+  filter->prevImage       = NULL;
+
+  vpiStreamCreate(0, &filter->vpi_stream);
+}
+
+/* ── finalize ────────────────────────────────────────────────────────────── */
+
+static void
+gst_my_filter_finalize (GObject * object)
+{
+  GstMyFilter *filter = GST_MYFILTER (object);
+
+  if (filter->optflow)      vpiPayloadDestroy(filter->optflow);
+  if (filter->pyrPrevFrame) vpiPyramidDestroy(filter->pyrPrevFrame);
+  if (filter->pyrCurFrame)  vpiPyramidDestroy(filter->pyrCurFrame);
+  if (filter->arrPrevPts)   vpiArrayDestroy(filter->arrPrevPts);
+  if (filter->arrCurPts)    vpiArrayDestroy(filter->arrCurPts);
+  if (filter->arrStatus)    vpiArrayDestroy(filter->arrStatus);
+  if (filter->prevImage)    vpiImageDestroy(filter->prevImage);
+  if (filter->vpi_stream)   vpiStreamDestroy(filter->vpi_stream);
+
+  G_OBJECT_CLASS (parent_class)->finalize (object);
+}
+
+/* ── VPI setup (called once caps are known) ──────────────────────────────── */
+
+static gboolean
+gst_my_filter_setup_vpi (GstMyFilter * filter)
+{
+  /* Pyramid parameters - adjust levels/scale to suit your motion range */
+  filter->levels = 4;
+  filter->scale  = 0.5f;
+
+  /* NV12 maps to VPI_IMAGE_FORMAT_NV12 */
+  filter->format = VPI_IMAGE_FORMAT_NV12_ER;
+
+  /* Pyramids for previous and current frame */
+  vpiPyramidCreate(filter->width, filter->height,
+      filter->format, filter->levels, filter->scale, 0,
+      &filter->pyrPrevFrame);
+
+  vpiPyramidCreate(filter->width, filter->height,
+      filter->format, filter->levels, filter->scale, 0,
+      &filter->pyrCurFrame);
+
+  /* Keypoint arrays - 1000 points is a reasonable starting budget */
+#define MAX_KEYPOINTS 1000
+  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0,
+      &filter->arrPrevPts);
+  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0,
+      &filter->arrCurPts);
+  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_U8, 0,
+      &filter->arrStatus);
+
+  /* LK params and payload */
+  vpiInitOpticalFlowPyrLKParams(VPI_BACKEND_CUDA, &filter->lkParams);
+
+  vpiCreateOpticalFlowPyrLK(VPI_BACKEND_CUDA,
+      filter->width, filter->height,
+      filter->format,
+      filter->levels, filter->scale,
+      &filter->optflow);
+
+  filter->vpi_initialized = TRUE;
+  return TRUE;
 }
 
 static void
@@ -185,7 +187,6 @@ gst_my_filter_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec)
 {
   GstMyFilter *filter = GST_MYFILTER (object);
-
   switch (prop_id) {
     case PROP_SILENT:
       filter->silent = g_value_get_boolean (value);
@@ -201,7 +202,6 @@ gst_my_filter_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec)
 {
   GstMyFilter *filter = GST_MYFILTER (object);
-
   switch (prop_id) {
     case PROP_SILENT:
       g_value_set_boolean (value, filter->silent);
@@ -212,17 +212,11 @@ gst_my_filter_get_property (GObject * object, guint prop_id,
   }
 }
 
-/* GstElement vmethod implementations */
-
-/* this function handles sink events */
 static gboolean
-gst_my_filter_sink_event (GstPad * pad, GstObject * parent,
-    GstEvent * event)
+gst_my_filter_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
 {
-  GstMyFilter *filter;
+  GstMyFilter *filter = GST_MYFILTER (parent);
   gboolean ret;
-
-  filter = GST_MYFILTER (parent);
 
   GST_LOG_OBJECT (filter, "Received %s event: %" GST_PTR_FORMAT,
       GST_EVENT_TYPE_NAME (event), event);
@@ -230,12 +224,33 @@ gst_my_filter_sink_event (GstPad * pad, GstObject * parent,
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_CAPS:
     {
-      GstCaps *caps;
+      GstCaps      *caps;
+      GstStructure *s;
 
       gst_event_parse_caps (event, &caps);
-      /* do something with the caps */
+      s = gst_caps_get_structure (caps, 0);
 
-      /* and forward */
+      gst_structure_get_int (s, "width",  &filter->width);
+      gst_structure_get_int (s, "height", &filter->height);
+
+      GST_DEBUG_OBJECT (filter, "Caps: %dx%d", filter->width, filter->height);
+
+      /* Tear down any previous VPI objects if caps changed mid-stream */
+      if (filter->vpi_initialized) {
+        vpiPayloadDestroy(filter->optflow);      filter->optflow     = NULL;
+        vpiPyramidDestroy(filter->pyrPrevFrame); filter->pyrPrevFrame = NULL;
+        vpiPyramidDestroy(filter->pyrCurFrame);  filter->pyrCurFrame  = NULL;
+        vpiArrayDestroy(filter->arrPrevPts);     filter->arrPrevPts   = NULL;
+        vpiArrayDestroy(filter->arrCurPts);      filter->arrCurPts    = NULL;
+        vpiArrayDestroy(filter->arrStatus);      filter->arrStatus    = NULL;
+        if (filter->prevImage) {
+          vpiImageDestroy(filter->prevImage);    filter->prevImage    = NULL;
+        }
+        filter->vpi_initialized = FALSE;
+      }
+
+      gst_my_filter_setup_vpi (filter);
+
       ret = gst_pad_event_default (pad, parent, event);
       break;
     }
@@ -246,57 +261,48 @@ gst_my_filter_sink_event (GstPad * pad, GstObject * parent,
   return ret;
 }
 
-/* chain function
- * this function does the actual processing
- */
 static GstFlowReturn
 gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
 {
-  GstMyFilter *filter;
+  GstMyFilter *filter = GST_MYFILTER (parent);
 
-  filter = GST_MYFILTER (parent);
+  if (!filter->vpi_initialized) {
+    GST_WARNING_OBJECT (filter, "VPI not initialised, passing buffer through");
+    return gst_pad_push (filter->srcpad, buf);
+  }
+  GstMapInfo map_info;
+  gst_buffer_map(buf, &map_info, GST_MAP_READ);
+  NvBufSurface *surface = (NvBufSurface *)map_info.data;
 
-  if (filter->silent == FALSE)
-    g_print ("I'm plugged, therefore I'm in.\n");
+  /* TODO:
+   * 1. Wrap buf into VPIImage (zero copy via NVMM)
+   * 2. Build pyramid for current frame
+   * 3. Submit LK optical flow (prev → cur)
+   * 4. vpiStreamSync()
+   * 5. CPU: fit homography + smooth
+   * 6. Submit perspective warp on CUDA
+   * 7. vpiStreamSync()
+   * 8. Unwrap VPIImage, push buffer
+   */
 
-  /* just push out the incoming buffer without touching it */
+   // 1
+
+
   return gst_pad_push (filter->srcpad, buf);
 }
 
-
-/* entry point to initialize the plug-in
- * initialize the plug-in itself
- * register the element factories and other features
- */
 static gboolean
 myfilter_init (GstPlugin * myfilter)
 {
-  /* debug category for filtering log messages
-   *
-   * exchange the string 'Template myfilter' with your description
-   */
   GST_DEBUG_CATEGORY_INIT (gst_my_filter_debug, "myfilter",
-      0, "Template myfilter");
-
+      0, "VPI video stabilisation filter");
   return GST_ELEMENT_REGISTER (my_filter, myfilter);
 }
 
-/* PACKAGE: this is usually set by meson depending on some _INIT macro
- * in meson.build and then written into and defined in config.h, but we can
- * just set it ourselves here in case someone doesn't use meson to
- * compile this code. GST_PLUGIN_DEFINE needs PACKAGE to be defined.
- */
 #ifndef PACKAGE
 #define PACKAGE "myfirstmyfilter"
 #endif
 
-/* gstreamer looks for this structure to register myfilters
- *
- * exchange the string 'Template myfilter' with your myfilter description
- */
-GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
-    GST_VERSION_MINOR,
-    myfilter,
-    "myfilter",
-    myfilter_init,
+GST_PLUGIN_DEFINE (GST_VERSION_MAJOR, GST_VERSION_MINOR,
+    myfilter, "myfilter", myfilter_init,
     PACKAGE_VERSION, GST_LICENSE, GST_PACKAGE_NAME, GST_PACKAGE_ORIGIN)
