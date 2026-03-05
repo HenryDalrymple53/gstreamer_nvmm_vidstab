@@ -8,7 +8,8 @@
 #include <vpi/Array.h>
 #include <nvbufsurface.h>
 #include <vpi/algo/OpticalFlowPyrLK.h>
-
+#include <vpi/algo/GaussianPyramid.h>
+#include <vpi/algo/PerspectiveWarp.h>
 G_BEGIN_DECLS
 
 #define GST_TYPE_MYFILTER (gst_my_filter_get_type())
@@ -46,7 +47,6 @@ struct _GstMyFilter
 
   /* Previous frame image for LK tracking */
   VPIImage prevImage;
-
   /* Flag to know if VPI objects have been initialized post-caps */
   gboolean vpi_initialized;
 };
