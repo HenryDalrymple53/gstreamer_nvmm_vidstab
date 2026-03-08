@@ -142,9 +142,9 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
   filter->levels = 4;
   filter->scale  = 0.5f;
 
-  filter->format = VPI_IMAGE_FORMAT_Y8_ER;
+  filter->format = VPI_IMAGE_FORMAT_U8;
   vpiImageCreate(filter->width, filter->height,
-      VPI_IMAGE_FORMAT_Y8_ER, VPI_BACKEND_CUDA, &filter->yImage);
+      VPI_IMAGE_FORMAT_U8, VPI_BACKEND_CUDA, &filter->yImage);
 
   vpiPyramidCreate(filter->width, filter->height,
       filter->format, filter->levels, filter->scale, 0,
@@ -164,13 +164,14 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
 
   /* LK params and payload */
   vpiInitOpticalFlowPyrLKParams(VPI_BACKEND_CUDA, &filter->lkParams);
+GST_DEBUG("  optflow (payload): %p", (void *)(filter->arrCurPts));
 
   vpiCreateOpticalFlowPyrLK(VPI_BACKEND_CUDA,
       filter->width, filter->height,
       filter->format,
       filter->levels, filter->scale,
       &filter->optflow);
-
+GST_DEBUG("  optflow (payload): %p", (void *)(filter->optflow));
   filter->vpi_initialized = TRUE;
   return TRUE;
 }
@@ -330,6 +331,77 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
 
   // 4. Only run optical flow if we have a previous frame
   if (filter->prevImage != NULL) {
+    GST_DEBUG("=== vpiSubmitOpticalFlowPyrLK Debug ===");
+
+/* Stream */
+GST_DEBUG("  vpi_stream       : %p", (void*)filter->vpi_stream);
+
+/* Backend */
+GST_DEBUG("  backend          : VPI_BACKEND_CUDA (0x%08X)", VPI_BACKEND_CUDA);
+
+/* Payload */
+GST_DEBUG("  optflow (payload): %p", (void*)filter->optflow);
+
+/* Pyramids */
+GST_DEBUG("  pyrPrevFrame     : %p", (void*)filter->pyrPrevFrame);
+GST_DEBUG("  pyrCurFrame      : %p", (void*)filter->pyrCurFrame);
+GST_DEBUG("  pyr levels       : %d", filter->levels);
+GST_DEBUG("  pyr scale        : %.4f", filter->scale);
+
+/* Point arrays */
+VPIArrayData arrPrevPtsData, arrCurPtsData, arrStatusData;
+int32_t prevPtsSize = 0, curPtsSize = 0, statusSize = 0;
+
+if (vpiArrayLockData(filter->arrPrevPts, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &arrPrevPtsData) == VPI_SUCCESS) {
+    prevPtsSize = arrPrevPtsData.buffer.aos.sizePointer ? *arrPrevPtsData.buffer.aos.sizePointer : -1;
+    GST_DEBUG("  arrPrevPts       : %p | capacity: %d | size: %d | type: %d",
+              (void*)filter->arrPrevPts,
+              arrPrevPtsData.buffer.aos.capacity,
+              prevPtsSize,
+              arrPrevPtsData.bufferType);
+    vpiArrayUnlock(filter->arrPrevPts);
+} else {
+    GST_WARNING("  arrPrevPts       : %p (lock failed)", (void*)filter->arrPrevPts);
+}
+
+if (vpiArrayLockData(filter->arrCurPts, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &arrCurPtsData) == VPI_SUCCESS) {
+    curPtsSize = arrCurPtsData.buffer.aos.sizePointer ? *arrCurPtsData.buffer.aos.sizePointer : -1;
+    GST_DEBUG("  arrCurPts        : %p | capacity: %d | size: %d | type: %d",
+              (void*)filter->arrCurPts,
+              arrCurPtsData.buffer.aos.capacity,
+              curPtsSize,
+              arrCurPtsData.bufferType);
+    vpiArrayUnlock(filter->arrCurPts);
+} else {
+    GST_WARNING("  arrCurPts        : %p (lock failed)", (void*)filter->arrCurPts);
+}
+
+if (vpiArrayLockData(filter->arrStatus, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &arrStatusData) == VPI_SUCCESS) {
+    statusSize = arrStatusData.buffer.aos.sizePointer ? *arrStatusData.buffer.aos.sizePointer : -1;
+    GST_DEBUG("  arrStatus        : %p | capacity: %d | size: %d | type: %d",
+              (void*)filter->arrStatus,
+              arrStatusData.buffer.aos.capacity,
+              statusSize,
+              arrStatusData.bufferType);
+    vpiArrayUnlock(filter->arrStatus);
+} else {
+    GST_WARNING("  arrStatus        : %p (lock failed)", (void*)filter->arrStatus);
+}
+
+/* LK Params */
+GST_DEBUG("  lkParams.windowDimension : %d", filter->lkParams.windowDimension);
+GST_DEBUG("  lkParams.numIterations   : %d", filter->lkParams.numIterations);
+GST_DEBUG("  lkParams.epsilon         : %.6f", filter->lkParams.epsilon);
+GST_DEBUG("  lkParams.useInitialFlow  : %d", filter->lkParams.useInitialFlow);
+
+/* Supporting images */
+GST_DEBUG("  prevImage        : %p", (void*)filter->prevImage);
+GST_DEBUG("  yImage           : %p", (void*)filter->yImage);
+
+/* Frame info */
+GST_DEBUG("  frame dims       : %dx%d", filter->width, filter->height);
+GST_DEBUG("  vpi_format       : 0x%08X", filter->format);
+GST_DEBUG("  vpi_initialized  : %s", filter->vpi_initialized ? "TRUE" : "FALSE");
     status = vpiSubmitOpticalFlowPyrLK(filter->vpi_stream,
                                        VPI_BACKEND_CUDA,
                                        filter->optflow,
@@ -344,7 +416,8 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
       vpiImageDestroy(curImage);
       gst_buffer_unmap(buf, &map_info);
       return GST_FLOW_ERROR;
-    }
+    } 
+
   }
 
   // 5. Wait for GPU work to finish
