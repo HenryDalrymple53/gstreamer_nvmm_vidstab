@@ -1,0 +1,6 @@
+{
+    "C_Cpp.default.includePath": [
+        "/usr/src/jetson_multimedia_api/include",
+        "/usr/include/gstreamer-1.0/gst/"
+    ]
+}

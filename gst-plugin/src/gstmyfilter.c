@@ -25,7 +25,7 @@ static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE (
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (
         "video/x-raw(memory:NVMM), "
-        "format = (string) NV12, "
+        "format = (string) RGBA, "
         "width = (int) [ 1, 32767 ], "
         "height = (int) [ 1, 32767 ], "
         "framerate = (fraction) [ 0/1, 2147483647/1 ]"
@@ -38,7 +38,7 @@ static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE (
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (
         "video/x-raw(memory:NVMM), "
-        "format = (string) NV12, "
+        "format = (string) RGBA, "
         "width = (int) [ 1, 32767 ], "
         "height = (int) [ 1, 32767 ], "
         "framerate = (fraction) [ 0/1, 2147483647/1 ]"
@@ -138,14 +138,14 @@ gst_my_filter_finalize (GObject * object)
 static gboolean
 gst_my_filter_setup_vpi (GstMyFilter * filter)
 {
-  /* Pyramid parameters - adjust levels/scale to suit your motion range */
+  /* Pyramid parameters */
   filter->levels = 4;
   filter->scale  = 0.5f;
 
-  /* NV12 maps to VPI_IMAGE_FORMAT_NV12 */
-  filter->format = VPI_IMAGE_FORMAT_NV12_ER;
+  filter->format = VPI_IMAGE_FORMAT_Y8_ER;
+  vpiImageCreate(filter->width, filter->height,
+      VPI_IMAGE_FORMAT_Y8_ER, VPI_BACKEND_CUDA, &filter->yImage);
 
-  /* Pyramids for previous and current frame */
   vpiPyramidCreate(filter->width, filter->height,
       filter->format, filter->levels, filter->scale, 0,
       &filter->pyrPrevFrame);
@@ -154,7 +154,6 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
       filter->format, filter->levels, filter->scale, 0,
       &filter->pyrCurFrame);
 
-  /* Keypoint arrays - 1000 points is a reasonable starting budget */
 #define MAX_KEYPOINTS 1000
   vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0,
       &filter->arrPrevPts);
@@ -231,7 +230,7 @@ gst_my_filter_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
 
       /* Tear down any previous VPI objects if caps changed mid-stream */
       if (filter->vpi_initialized) {
-        vpiPayloadDestroy(filter->optflow);      filter->optflow     = NULL;
+        vpiPayloadDestroy(filter->optflow);      filter->optflow      = NULL;
         vpiPyramidDestroy(filter->pyrPrevFrame); filter->pyrPrevFrame = NULL;
         vpiPyramidDestroy(filter->pyrCurFrame);  filter->pyrCurFrame  = NULL;
         vpiArrayDestroy(filter->arrPrevPts);     filter->arrPrevPts   = NULL;
@@ -239,6 +238,9 @@ gst_my_filter_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
         vpiArrayDestroy(filter->arrStatus);      filter->arrStatus    = NULL;
         if (filter->prevImage) {
           vpiImageDestroy(filter->prevImage);    filter->prevImage    = NULL;
+        }
+        if (filter->yImage) {
+          vpiImageDestroy(filter->yImage);       filter->yImage       = NULL;
         }
         filter->vpi_initialized = FALSE;
       }
@@ -265,7 +267,7 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     return gst_pad_push (filter->srcpad, buf);
   }
 
-  // 1. Wrap NvBufSurface into VPIImage (zero-copy)
+  // 1. Wrap NvBufSurface (RGBA NVMM) into VPIImage (zero-copy via fd)
   GstMapInfo map_info;
   if (!gst_buffer_map(buf, &map_info, GST_MAP_READ)) {
     GST_ERROR_OBJECT(filter, "Failed to map input buffer");
@@ -273,24 +275,50 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   }
 
   NvBufSurface *surface = (NvBufSurface *)map_info.data;
+  GST_WARNING_OBJECT(filter,
+    "surface: fd=%d memType=%d layout=%d colorFormat=%d",
+    surface->surfaceList[0].bufferDesc,
+    surface->memType,
+    surface->surfaceList[0].layout,
+    surface->surfaceList[0].colorFormat);
 
+  // Zero-copy wrap of RGBA NVMM buffer via dmabuf fd
   VPIImageData img_data;
   memset(&img_data, 0, sizeof(img_data));
   img_data.bufferType = VPI_IMAGE_BUFFER_NVBUFFER;
   img_data.buffer.fd  = surface->surfaceList[0].bufferDesc;
 
   VPIImage curImage = NULL;
-  VPIStatus status = vpiImageCreateWrapper(&img_data, NULL, 0, &curImage);
+  VPIStatus status = vpiImageCreateWrapper(&img_data, NULL, VPI_BACKEND_CUDA, &curImage);
   if (status != VPI_SUCCESS) {
     GST_ERROR_OBJECT(filter, "vpiImageCreateWrapper failed: %s", vpiStatusGetName(status));
     gst_buffer_unmap(buf, &map_info);
     return GST_FLOW_ERROR;
   }
 
-  // 2. Build Gaussian pyramid for current frame
+  {
+    int32_t img_w = 0, img_h = 0;
+    VPIImageFormat img_fmt = 0;
+    vpiImageGetSize(curImage, &img_w, &img_h);
+    vpiImageGetFormat(curImage, &img_fmt);
+    GST_WARNING_OBJECT(filter,
+        "curImage (RGBA): size=%dx%d fmt=0x%08X",
+        img_w, img_h, (unsigned)img_fmt);
+  }
+
+  status = vpiSubmitConvertImageFormat(filter->vpi_stream, VPI_BACKEND_CUDA,
+      curImage, filter->yImage, NULL);
+  if (status != VPI_SUCCESS) {
+    GST_ERROR_OBJECT(filter, "ConvertImageFormat RGBA->Y8 failed: %s", vpiStatusGetName(status));
+    vpiImageDestroy(curImage);
+    gst_buffer_unmap(buf, &map_info);
+    return GST_FLOW_ERROR;
+  }
+
+  // 3. Build Gaussian pyramid for current frame (on Y8)
   status = vpiSubmitGaussianPyramidGenerator(filter->vpi_stream,
                                              VPI_BACKEND_CUDA,
-                                             curImage,
+                                             filter->yImage,
                                              filter->pyrCurFrame,
                                              VPI_BORDER_CLAMP);
   if (status != VPI_SUCCESS) {
@@ -300,7 +328,7 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     return GST_FLOW_ERROR;
   }
 
-  // 3. Only run optical flow if we have a previous frame
+  // 4. Only run optical flow if we have a previous frame
   if (filter->prevImage != NULL) {
     status = vpiSubmitOpticalFlowPyrLK(filter->vpi_stream,
                                        VPI_BACKEND_CUDA,
@@ -319,36 +347,34 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     }
   }
 
-  // 4. Wait for GPU work to finish
+  // 5. Wait for GPU work to finish
   vpiStreamSync(filter->vpi_stream);
 
-  // TODO 5: CPU - read arrCurPts/arrPrevPts, fit homography, smooth it
+  // TODO 6: CPU - read arrCurPts/arrPrevPts, fit homography, smooth it
 
-  // TODO 6: vpiSubmitPerspectiveWarp() on CUDA
+  // TODO 7: vpiSubmitPerspectiveWarp() on CUDA
 
-  // TODO 7: vpiStreamSync() after warp
+  // TODO 8: vpiStreamSync() after warp
 
-  // 8. Swap prev <-> cur for next frame
-  // Destroy old prevImage and take ownership of curImage
+  // 9. Swap prev <-> cur for next frame
   if (filter->prevImage != NULL) {
     vpiImageDestroy(filter->prevImage);
   }
   filter->prevImage = curImage;
   curImage = NULL;
 
-  // Swap pyramids
   VPIPyramid tmpPyr    = filter->pyrPrevFrame;
   filter->pyrPrevFrame = filter->pyrCurFrame;
   filter->pyrCurFrame  = tmpPyr;
 
-  // Swap point arrays
-  VPIArray tmpArr      = filter->arrPrevPts;
-  filter->arrPrevPts   = filter->arrCurPts;
-  filter->arrCurPts    = tmpArr;
+  VPIArray tmpArr    = filter->arrPrevPts;
+  filter->arrPrevPts = filter->arrCurPts;
+  filter->arrCurPts  = tmpArr;
 
   gst_buffer_unmap(buf, &map_info);
   return gst_pad_push(filter->srcpad, buf);
 }
+
 static gboolean
 myfilter_init (GstPlugin * myfilter)
 {
