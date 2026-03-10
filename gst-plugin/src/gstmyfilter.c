@@ -313,6 +313,30 @@ gst_my_filter_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
   return ret;
 }
 
+static void
+mat3_multiply (VPIPerspectiveTransform result,
+               const VPIPerspectiveTransform a,
+               const VPIPerspectiveTransform b)
+{
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) {
+      result[i][j] = 0.0f;
+      for (int k = 0; k < 3; k++)
+        result[i][j] += a[i][k] * b[k][j];
+    }
+}
+
+static float
+min (float x, float y){
+  if(x < y){
+    return x;
+  }
+  else{
+    return y;
+  }
+}
+
+
 static GstFlowReturn
 gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
 {
@@ -421,12 +445,42 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   vpiStreamSync(filter->vpi_stream);
 
   // TODO 6: CPU - read arrCurPts/arrPrevPts, fit homography, smooth it
-  double rad = filter->frameCount * M_PI / 180.0;
-  VPIPerspectiveTransform tmp = {
+
+  //Calculate rad from pts
+  
+  double rad = filter->frameCount * 3 * M_PI / 180.0;
+  double w = (double)filter->width;
+  double h = (double)filter->height;
+  double scaleX = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * h / w);
+  double scaleY = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * w / h);
+  double aspectScale = min(scaleX, scaleY);
+
+  VPIPerspectiveTransform rotation = {
     {cos(rad), -sin(rad), 0.0 },
     {sin(rad),  cos(rad), 0.0 },
     {0.0,  0.0, 1.0 }
   };
+  VPIPerspectiveTransform to_center = {
+    {1.0, 0.0, filter->width/2.0f },
+    {0.0,  1.0, filter->height/2.0f },
+    {0.0,  0.0, 1.0 }
+  };
+  VPIPerspectiveTransform from_center = {
+    {1.0, 0.0, -filter->width/2.0f },
+    {0.0,  1.0, -filter->height/2.0f },
+    {0.0,  0.0, 1.0 }
+  };
+  VPIPerspectiveTransform scale = {
+    {aspectScale, 0.0, 0.0},
+    {0.0,  aspectScale, 0.0},
+    {0.0,  0.0, 1.0 }
+  };
+
+  VPIPerspectiveTransform tmp, translate, final_mat;
+  mat3_multiply(tmp, to_center, scale);
+  mat3_multiply(translate, tmp, rotation);
+  mat3_multiply(final_mat, translate, from_center);
+  
   //memcpy(filter->transform, tmp, sizeof(VPIPerspectiveTransform));
   // TODO 7: vpiSubmitPerspectiveWarp() on CUDA
   // Unfortunately needs a copy buffer? hml
@@ -434,7 +488,7 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   status = vpiSubmitPerspectiveWarp(filter->vpi_stream, 
                                     VPI_BACKEND_CUDA, 
                                     curImage, 
-                                    tmp, 
+                                    final_mat, 
                                     filter->warpedImage, 
                                     NULL, 
                                     VPI_INTERP_LINEAR, 
