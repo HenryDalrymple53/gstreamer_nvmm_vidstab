@@ -65,6 +65,13 @@ struct _GstMyFilter
 
   /* Flag to know if VPI objects have been initialized post-caps */
   gboolean vpi_initialized;
+
+  /*warped imgae*/
+  VPIImage warpedImage;
+  VPIPerspectiveTransform transform;
+
+  NvBufSurface *warpedSurface;
+
   
 };
 

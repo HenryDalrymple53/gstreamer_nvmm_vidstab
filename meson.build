@@ -15,6 +15,8 @@ gstbase_dep = dependency('gstreamer-base-1.0', version : '>=1.19',
 
 vpi_dep = dependency('vpi', required: true)
 
+m_dep = cc.find_library('m', required: true)
+
 nvbufsurface_dep = declare_dependency(
   include_directories: include_directories('/usr/src/jetson_multimedia_api/include'),
   dependencies: [

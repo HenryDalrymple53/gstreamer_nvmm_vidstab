@@ -46,7 +46,7 @@ gstaudiofilterexample = library('gstaudiofilterexample',
 gstmyfilterexample = library('gstmyfilter',
   gstmyfilter_sources,
   c_args: plugin_c_args,
-  dependencies : [gst_dep, gstbase_dep, vpi_dep,nvbufsurface_dep],
+  dependencies : [gst_dep, gstbase_dep, vpi_dep,nvbufsurface_dep,m_dep],
   install : true,
   install_dir : plugins_install_dir,
 )

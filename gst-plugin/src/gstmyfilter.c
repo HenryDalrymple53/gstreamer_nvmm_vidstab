@@ -4,6 +4,8 @@
 
 #include <gst/gst.h>
 #include "gstmyfilter.h"
+#include <math.h>
+
 
 GST_DEBUG_CATEGORY_STATIC (gst_my_filter_debug);
 #define GST_CAT_DEFAULT gst_my_filter_debug
@@ -117,7 +119,8 @@ gst_my_filter_init (GstMyFilter * filter)
   filter->harrisScores          = NULL;
   filter->harrisGauss     = NULL;
   filter->harris          = NULL;
-  filter->frameCount    = 0;
+  filter->frameCount      = 0;
+  filter->warpedImage      = NULL;
 
   vpiStreamCreate(0, &filter->vpi_stream);
 }
@@ -133,7 +136,13 @@ gst_my_filter_finalize (GObject * object)
   if (filter->arrPrevPts)   vpiArrayDestroy(filter->arrPrevPts);
   if (filter->arrCurPts)    vpiArrayDestroy(filter->arrCurPts);
   if (filter->arrStatus)    vpiArrayDestroy(filter->arrStatus);
+  if (filter->harrisScores)    vpiArrayDestroy(filter->harrisScores);
   if (filter->prevImage)    vpiImageDestroy(filter->prevImage);
+  if (filter->harrisGauss)    vpiImageDestroy(filter->harrisGauss);
+  if (filter->warpedImage)    vpiImageDestroy(filter->warpedImage);
+
+  
+
   if (filter->vpi_stream)   vpiStreamDestroy(filter->vpi_stream);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -150,6 +159,8 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
   filter->format = VPI_IMAGE_FORMAT_U8;
   vpiImageCreate(filter->width, filter->height,
       VPI_IMAGE_FORMAT_U8, VPI_BACKEND_CUDA, &filter->yImage);
+  vpiImageCreate(filter->width, filter->height,
+    VPI_IMAGE_FORMAT_RGBA8, VPI_BACKEND_CUDA, &filter->warpedImage);
 
   vpiPyramidCreate(filter->width, filter->height,
       filter->format, filter->levels, filter->scale, 0,
@@ -168,6 +179,7 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
       &filter->arrStatus);
   vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_U32, 0, 
       &filter->harrisScores);
+  
 
   /* LK params and payload */
   vpiInitOpticalFlowPyrLKParams(VPI_BACKEND_CUDA, &filter->lkParams);
@@ -184,6 +196,24 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
     filter->width, 
     filter->height,
     &filter->harris);
+
+
+  NvBufSurfaceCreateParams params = {0};
+  params.gpuId       = 0;
+  params.width       = filter->width;
+  params.height      = filter->height;
+  params.colorFormat = NVBUF_COLOR_FORMAT_RGBA;
+  params.memType     = NVBUF_MEM_DEFAULT;
+  params.layout      = NVBUF_LAYOUT_PITCH;
+  NvBufSurfaceCreate(&filter->warpedSurface, 1, &params);
+
+  VPIImageData warped_data;
+  memset(&warped_data, 0, sizeof(warped_data));
+  warped_data.bufferType = VPI_IMAGE_BUFFER_NVBUFFER;
+  warped_data.buffer.fd  = filter->warpedSurface->surfaceList[0].bufferDesc;
+  vpiImageCreateWrapper(&warped_data, NULL, VPI_BACKEND_CUDA, &filter->warpedImage);
+
+
 
  
 GST_DEBUG("  optflow (payload): %p", (void *)(filter->optflow));
@@ -252,11 +282,21 @@ gst_my_filter_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
         vpiArrayDestroy(filter->arrPrevPts);     filter->arrPrevPts   = NULL;
         vpiArrayDestroy(filter->arrCurPts);      filter->arrCurPts    = NULL;
         vpiArrayDestroy(filter->arrStatus);      filter->arrStatus    = NULL;
+        vpiArrayDestroy(filter->harrisScores);   filter->harrisScores = NULL;
+        
+
+
         if (filter->prevImage) {
           vpiImageDestroy(filter->prevImage);    filter->prevImage    = NULL;
         }
         if (filter->yImage) {
           vpiImageDestroy(filter->yImage);       filter->yImage       = NULL;
+        }
+        if (filter->harrisGauss) {
+          vpiImageDestroy(filter->harrisGauss);  filter->harrisGauss  = NULL;
+        }
+        if (filter->warpedImage) {
+          vpiImageDestroy(filter->warpedImage);  filter->warpedImage  = NULL;
         }
         filter->vpi_initialized = FALSE;
       }
@@ -336,23 +376,29 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
 
 
   //Logic for Harris Edge detection using VPI
-  status = vpiSubmitHarrisCornerDetector(filter->vpi_stream,
-                                VPI_BACKEND_CUDA,
-                                filter->harris,
-                                filter->harrisGauss,
-                                filter->arrCurPts,
-                                filter->harrisScores,
-                                &filter->harrisParams);
-  if (status != VPI_SUCCESS) {
-      GST_ERROR_OBJECT(filter, "harris corner detector failed: %s", vpiStatusGetName(status));
-      vpiImageDestroy(curImage);
-      gst_buffer_unmap(buf, &map_info);
-      return GST_FLOW_ERROR;
-  } 
+  if(filter->frameCount >= 30){
+    status = vpiSubmitHarrisCornerDetector(filter->vpi_stream,
+                                  VPI_BACKEND_CUDA,
+                                  filter->harris,
+                                  filter->harrisGauss,
+                                  filter->arrCurPts,
+                                  filter->harrisScores,
+                                  &filter->harrisParams);
+    if (status != VPI_SUCCESS) {
+        GST_ERROR_OBJECT(filter, "harris corner detector failed: %s", vpiStatusGetName(status));
+        vpiImageDestroy(curImage);
+        gst_buffer_unmap(buf, &map_info);
+        return GST_FLOW_ERROR;
+    }
+    filter->frameCount = 0;
+
+  }
+  
 
 
   // 4. Only run optical flow if we have a previous frame
   if (filter->prevImage != NULL) {
+    filter->frameCount +=1;
     status = vpiSubmitOpticalFlowPyrLK(filter->vpi_stream,
                                        VPI_BACKEND_CUDA,
                                        filter->optflow,
@@ -375,10 +421,39 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   vpiStreamSync(filter->vpi_stream);
 
   // TODO 6: CPU - read arrCurPts/arrPrevPts, fit homography, smooth it
-
+  double rad = filter->frameCount * M_PI / 180.0;
+  VPIPerspectiveTransform tmp = {
+    {cos(rad), -sin(rad), 0.0 },
+    {sin(rad),  cos(rad), 0.0 },
+    {0.0,  0.0, 1.0 }
+  };
+  //memcpy(filter->transform, tmp, sizeof(VPIPerspectiveTransform));
   // TODO 7: vpiSubmitPerspectiveWarp() on CUDA
-
+  // Unfortunately needs a copy buffer? hml
+  
+  status = vpiSubmitPerspectiveWarp(filter->vpi_stream, 
+                                    VPI_BACKEND_CUDA, 
+                                    curImage, 
+                                    tmp, 
+                                    filter->warpedImage, 
+                                    NULL, 
+                                    VPI_INTERP_LINEAR, 
+                                    VPI_BORDER_ZERO, 
+                                    0);
+  if (status != VPI_SUCCESS) {
+      GST_ERROR_OBJECT(filter, "Perspective warp failed: %s", vpiStatusGetName(status));
+      vpiImageDestroy(curImage);
+      gst_buffer_unmap(buf, &map_info);
+      return GST_FLOW_ERROR;
+  } 
+  
+  
   // TODO 8: vpiStreamSync() after warp
+  vpiStreamSync(filter->vpi_stream);
+  NvBufSurfaceCopy(filter->warpedSurface, surface);
+  
+  
+  
 
   // 9. Swap prev <-> cur for next frame
   if (filter->prevImage != NULL) {
@@ -394,6 +469,8 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   VPIArray tmpArr    = filter->arrPrevPts;
   filter->arrPrevPts = filter->arrCurPts;
   filter->arrCurPts  = tmpArr;
+
+
 
   gst_buffer_unmap(buf, &map_info);
   return gst_pad_push(filter->srcpad, buf);
