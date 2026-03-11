@@ -223,6 +223,34 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
   /* Transform estimator */
   vpiInitTransformEstimatorParams(VPI_XFORM_CONSTRAINED_HOMOGRAPHY_2D,
                                   &filter->transformParams);
+  filter->transformParams.ransacMaxIterations          = 25;
+  filter->transformParams.ransacReprojErrorTolerance   = 3.0f;
+  filter->transformParams.ransacConfidenceLevel        = 0.70f;
+  filter->transformParams.ransacSeed                   = 0;
+
+  filter->transformParams.solverMaxIterations          = 1;
+
+  filter->transformParams.maxRefinementIterations      = 2;      // 10 is overkill
+
+  /* Constrained homography — rigid motion only (translation + rotation, no scale/shear) */
+  filter->transformParams.xfcfg.constrainedHomography2D.isAffine         = 1;
+  filter->transformParams.xfcfg.constrainedHomography2D.isIsotropicScale = 1;
+
+  /* Lock scale to 1.0 (no zoom) */
+  filter->transformParams.xfcfg.constrainedHomography2D.minXScale = 1.0f;
+  filter->transformParams.xfcfg.constrainedHomography2D.maxXScale = 1.0f;
+  filter->transformParams.xfcfg.constrainedHomography2D.minYScale = 1.0f;
+  filter->transformParams.xfcfg.constrainedHomography2D.maxYScale = 1.0f;
+
+  /* Clamp rotation to ±5 degrees — larger rotations are likely noise */
+  filter->transformParams.xfcfg.constrainedHomography2D.minRotation = -5.0f * M_PI / 180.0f;
+  filter->transformParams.xfcfg.constrainedHomography2D.maxRotation =  5.0f * M_PI / 180.0f;
+
+  /* Clamp translation to ±100px — adjust to your expected jitter range */
+  filter->transformParams.xfcfg.constrainedHomography2D.minXTranslation = -10.0f;
+  filter->transformParams.xfcfg.constrainedHomography2D.maxXTranslation =  10.0f;
+  filter->transformParams.xfcfg.constrainedHomography2D.minYTranslation = -10.0f;
+  filter->transformParams.xfcfg.constrainedHomography2D.maxYTranslation =  10.0f;
   VPIStatus status = vpiCreateTransformEstimator(VPI_BACKEND_CPU,
                                                  MAX_KEYPOINTS,
                                                  &filter->transformPayload);

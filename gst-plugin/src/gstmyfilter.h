@@ -50,7 +50,7 @@ struct _GstMyFilter
   /* Create harris Payload */
   VPIPayload harris;
   VPIHarrisCornerDetectorParams harrisParams;
-  uint8_t frameCount;
+  uint64_t frameCount;
 
   /* Optical flow payload */
   VPIPayload optflow;
