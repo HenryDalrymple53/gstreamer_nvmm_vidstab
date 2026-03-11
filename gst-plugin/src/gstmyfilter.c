@@ -104,25 +104,64 @@ gst_my_filter_init (GstMyFilter * filter)
   GST_PAD_SET_PROXY_CAPS (filter->srcpad);
   gst_element_add_pad (GST_ELEMENT (filter), filter->srcpad);
 
-  filter->silent          = FALSE;
-  filter->vpi_initialized = FALSE;
-  filter->width           = 0;
-  filter->height          = 0;
-  filter->vpi_stream      = NULL;
-  filter->pyrPrevFrame    = NULL;
-  filter->pyrCurFrame     = NULL;
-  filter->arrPrevPts      = NULL;
-  filter->arrCurPts       = NULL;
-  filter->arrStatus       = NULL;
-  filter->optflow         = NULL;
-  filter->prevImage       = NULL;
-  filter->harrisScores          = NULL;
-  filter->harrisGauss     = NULL;
-  filter->harris          = NULL;
-  filter->frameCount      = 0;
+  filter->silent           = FALSE;
+  filter->vpi_initialized  = FALSE;
+  filter->width            = 0;
+  filter->height           = 0;
+  filter->vpi_stream       = NULL;
+  filter->pyrPrevFrame     = NULL;
+  filter->pyrCurFrame      = NULL;
+  filter->arrPrevPts       = NULL;
+  filter->arrCurPts        = NULL;
+  filter->arrStatus        = NULL;
+  filter->optflow          = NULL;
+  filter->prevImage        = NULL;
+  filter->harrisScores     = NULL;
+  filter->harrisGauss      = NULL;
+  filter->harris           = NULL;
+  filter->frameCount       = 0;
   filter->warpedImage      = NULL;
+  filter->yImage           = NULL;
+  filter->transform        = NULL;
+  filter->arrMatches       = NULL;
+  filter->transformPayload = NULL;
+  filter->warpedSurface    = NULL;
 
-  vpiStreamCreate(0, &filter->vpi_stream);
+  vpiStreamCreate(VPI_BACKEND_CUDA | VPI_BACKEND_CPU, &filter->vpi_stream);
+}
+
+/* Tears down all VPI/NvBuf objects, leaving pointers NULL. */
+static void
+gst_my_filter_teardown_vpi (GstMyFilter * filter)
+{
+  /* Payloads */
+  if (filter->optflow)          { vpiPayloadDestroy(filter->optflow);          filter->optflow          = NULL; }
+  if (filter->harris)           { vpiPayloadDestroy(filter->harris);           filter->harris           = NULL; }
+  if (filter->transformPayload) { vpiPayloadDestroy(filter->transformPayload); filter->transformPayload = NULL; }
+
+  /* Pyramids */
+  if (filter->pyrPrevFrame) { vpiPyramidDestroy(filter->pyrPrevFrame); filter->pyrPrevFrame = NULL; }
+  if (filter->pyrCurFrame)  { vpiPyramidDestroy(filter->pyrCurFrame);  filter->pyrCurFrame  = NULL; }
+
+  /* Arrays */
+  if (filter->arrPrevPts)   { vpiArrayDestroy(filter->arrPrevPts);   filter->arrPrevPts   = NULL; }
+  if (filter->arrCurPts)    { vpiArrayDestroy(filter->arrCurPts);    filter->arrCurPts    = NULL; }
+  if (filter->arrStatus)    { vpiArrayDestroy(filter->arrStatus);    filter->arrStatus    = NULL; }
+  if (filter->harrisScores) { vpiArrayDestroy(filter->harrisScores); filter->harrisScores = NULL; }
+  if (filter->arrMatches)   { vpiArrayDestroy(filter->arrMatches);   filter->arrMatches   = NULL; }
+  if (filter->transform)    { vpiArrayDestroy(filter->transform);    filter->transform    = NULL; }
+
+  /* Images — harrisGauss is a wrapper (pyramid level), destroy before the pyramid */
+  if (filter->harrisGauss)  { vpiImageDestroy(filter->harrisGauss);  filter->harrisGauss  = NULL; }
+  if (filter->prevImage)    { vpiImageDestroy(filter->prevImage);     filter->prevImage    = NULL; }
+  if (filter->yImage)       { vpiImageDestroy(filter->yImage);        filter->yImage       = NULL; }
+  /* warpedImage is a wrapper over warpedSurface — destroy wrapper before surface */
+  if (filter->warpedImage)  { vpiImageDestroy(filter->warpedImage);   filter->warpedImage  = NULL; }
+
+  /* NvBufSurface */
+  if (filter->warpedSurface) { NvBufSurfaceDestroy(filter->warpedSurface); filter->warpedSurface = NULL; }
+
+  filter->vpi_initialized = FALSE;
 }
 
 static void
@@ -130,20 +169,9 @@ gst_my_filter_finalize (GObject * object)
 {
   GstMyFilter *filter = GST_MYFILTER (object);
 
-  if (filter->optflow)      vpiPayloadDestroy(filter->optflow);
-  if (filter->pyrPrevFrame) vpiPyramidDestroy(filter->pyrPrevFrame);
-  if (filter->pyrCurFrame)  vpiPyramidDestroy(filter->pyrCurFrame);
-  if (filter->arrPrevPts)   vpiArrayDestroy(filter->arrPrevPts);
-  if (filter->arrCurPts)    vpiArrayDestroy(filter->arrCurPts);
-  if (filter->arrStatus)    vpiArrayDestroy(filter->arrStatus);
-  if (filter->harrisScores)    vpiArrayDestroy(filter->harrisScores);
-  if (filter->prevImage)    vpiImageDestroy(filter->prevImage);
-  if (filter->harrisGauss)    vpiImageDestroy(filter->harrisGauss);
-  if (filter->warpedImage)    vpiImageDestroy(filter->warpedImage);
+  gst_my_filter_teardown_vpi (filter);
 
-  
-
-  if (filter->vpi_stream)   vpiStreamDestroy(filter->vpi_stream);
+  if (filter->vpi_stream) { vpiStreamDestroy(filter->vpi_stream); filter->vpi_stream = NULL; }
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -152,52 +180,58 @@ gst_my_filter_finalize (GObject * object)
 static gboolean
 gst_my_filter_setup_vpi (GstMyFilter * filter)
 {
-  /* Pyramid parameters */
   filter->levels = 4;
   filter->scale  = 0.5f;
-
   filter->format = VPI_IMAGE_FORMAT_U8;
+
+  /* Grayscale working image */
   vpiImageCreate(filter->width, filter->height,
       VPI_IMAGE_FORMAT_U8, VPI_BACKEND_CUDA, &filter->yImage);
-  vpiImageCreate(filter->width, filter->height,
-    VPI_IMAGE_FORMAT_RGBA8, VPI_BACKEND_CUDA, &filter->warpedImage);
 
+  /* Pyramids */
   vpiPyramidCreate(filter->width, filter->height,
       filter->format, filter->levels, filter->scale, 0,
       &filter->pyrPrevFrame);
-
   vpiPyramidCreate(filter->width, filter->height,
       filter->format, filter->levels, filter->scale, 0,
       &filter->pyrCurFrame);
 
-  #define MAX_KEYPOINTS 1000
-  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0,
-      &filter->arrPrevPts);
-  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0,
-      &filter->arrCurPts);
-  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_U8, 0,
-      &filter->arrStatus);
-  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_U32, 0, 
-      &filter->harrisScores);
-  
+  /* Arrays */
+#define MAX_KEYPOINTS 1000
+  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0, &filter->arrPrevPts);
+  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0, &filter->arrCurPts);
+  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_U8,           0, &filter->arrStatus);
+  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_U32,          0, &filter->harrisScores);
+  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_MATCHES,      0, &filter->arrMatches);
+  vpiArrayCreate(1, VPI_ARRAY_TYPE_HOMOGRAPHY_TRANSFORM_2D,  0, &filter->transform);
 
-  /* LK params and payload */
+  /* LK optical flow */
   vpiInitOpticalFlowPyrLKParams(VPI_BACKEND_CUDA, &filter->lkParams);
+  vpiCreateOpticalFlowPyrLK(VPI_BACKEND_CUDA,
+                            filter->width, filter->height,
+                            filter->format,
+                            filter->levels, filter->scale,
+                            &filter->optflow);
+
+  /* Harris corner detector */
   vpiInitHarrisCornerDetectorParams(&filter->harrisParams);
   filter->harrisParams.sensitivity = 0.01;
+  vpiCreateHarrisCornerDetector(VPI_BACKEND_CUDA,
+                                filter->width, filter->height,
+                                &filter->harris);
 
-  vpiCreateOpticalFlowPyrLK(VPI_BACKEND_CUDA,
-      filter->width, filter->height,
-      filter->format,
-      filter->levels, filter->scale,
-      &filter->optflow);
+  /* Transform estimator */
+  vpiInitTransformEstimatorParams(VPI_XFORM_CONSTRAINED_HOMOGRAPHY_2D,
+                                  &filter->transformParams);
+  VPIStatus status = vpiCreateTransformEstimator(VPI_BACKEND_CPU,
+                                                 MAX_KEYPOINTS,
+                                                 &filter->transformPayload);
+  if (status != VPI_SUCCESS) {
+    GST_ERROR_OBJECT(filter, "Create Transform failed: %s", vpiStatusGetName(status));
+    return FALSE;
+  }
 
-  vpiCreateHarrisCornerDetector(VPI_BACKEND_CUDA, 
-    filter->width, 
-    filter->height,
-    &filter->harris);
-
-
+  /* Warped output surface + VPI wrapper */
   NvBufSurfaceCreateParams params = {0};
   params.gpuId       = 0;
   params.width       = filter->width;
@@ -213,10 +247,9 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
   warped_data.buffer.fd  = filter->warpedSurface->surfaceList[0].bufferDesc;
   vpiImageCreateWrapper(&warped_data, NULL, VPI_BACKEND_CUDA, &filter->warpedImage);
 
+  /* harrisGauss is created per-frame as a pyramid-level wrapper — not here */
 
-
- 
-GST_DEBUG("  optflow (payload): %p", (void *)(filter->optflow));
+  GST_DEBUG_OBJECT(filter, "VPI setup complete: optflow=%p", (void *)filter->optflow);
   filter->vpi_initialized = TRUE;
   return TRUE;
 }
@@ -274,32 +307,8 @@ gst_my_filter_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
 
       GST_DEBUG_OBJECT (filter, "Caps: %dx%d", filter->width, filter->height);
 
-      /* Tear down any previous VPI objects if caps changed mid-stream */
-      if (filter->vpi_initialized) {
-        vpiPayloadDestroy(filter->optflow);      filter->optflow      = NULL;
-        vpiPyramidDestroy(filter->pyrPrevFrame); filter->pyrPrevFrame = NULL;
-        vpiPyramidDestroy(filter->pyrCurFrame);  filter->pyrCurFrame  = NULL;
-        vpiArrayDestroy(filter->arrPrevPts);     filter->arrPrevPts   = NULL;
-        vpiArrayDestroy(filter->arrCurPts);      filter->arrCurPts    = NULL;
-        vpiArrayDestroy(filter->arrStatus);      filter->arrStatus    = NULL;
-        vpiArrayDestroy(filter->harrisScores);   filter->harrisScores = NULL;
-        
-
-
-        if (filter->prevImage) {
-          vpiImageDestroy(filter->prevImage);    filter->prevImage    = NULL;
-        }
-        if (filter->yImage) {
-          vpiImageDestroy(filter->yImage);       filter->yImage       = NULL;
-        }
-        if (filter->harrisGauss) {
-          vpiImageDestroy(filter->harrisGauss);  filter->harrisGauss  = NULL;
-        }
-        if (filter->warpedImage) {
-          vpiImageDestroy(filter->warpedImage);  filter->warpedImage  = NULL;
-        }
-        filter->vpi_initialized = FALSE;
-      }
+      if (filter->vpi_initialized)
+        gst_my_filter_teardown_vpi (filter);
 
       gst_my_filter_setup_vpi (filter);
 
@@ -327,14 +336,7 @@ mat3_multiply (VPIPerspectiveTransform result,
 }
 
 static float
-min (float x, float y){
-  if(x < y){
-    return x;
-  }
-  else{
-    return y;
-  }
-}
+fmin_f (float x, float y) { return x < y ? x : y; }
 
 
 static GstFlowReturn
@@ -347,17 +349,15 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     return gst_pad_push (filter->srcpad, buf);
   }
 
-  // 1. Wrap NvBufSurface (RGBA NVMM) into VPIImage (zero-copy via fd)
+  /* ── 1. Map GStreamer buffer → NvBufSurface ── */
   GstMapInfo map_info;
   if (!gst_buffer_map(buf, &map_info, GST_MAP_READ)) {
     GST_ERROR_OBJECT(filter, "Failed to map input buffer");
     return GST_FLOW_ERROR;
   }
-
   NvBufSurface *surface = (NvBufSurface *)map_info.data;
- 
 
-  // Zero-copy wrap of RGBA NVMM buffer via dmabuf fd
+  /* ── 2. Wrap current frame as VPIImage (zero-copy dmabuf) ── */
   VPIImageData img_data;
   memset(&img_data, 0, sizeof(img_data));
   img_data.bufferType = VPI_IMAGE_BUFFER_NVBUFFER;
@@ -371,163 +371,153 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     return GST_FLOW_ERROR;
   }
 
-
+  /* ── 3+4. Submit RGBA→Y8 and pyramid back-to-back, no sync between them ── */
   status = vpiSubmitConvertImageFormat(filter->vpi_stream, VPI_BACKEND_CUDA,
-      curImage, filter->yImage, NULL);
+                                       curImage, filter->yImage, NULL);
   if (status != VPI_SUCCESS) {
-    GST_ERROR_OBJECT(filter, "ConvertImageFormat RGBA->Y8 failed: %s", vpiStatusGetName(status));
-    vpiImageDestroy(curImage);
-    gst_buffer_unmap(buf, &map_info);
-    return GST_FLOW_ERROR;
+    GST_ERROR_OBJECT(filter, "ConvertImageFormat failed: %s", vpiStatusGetName(status));
+    goto error_destroy_cur;
   }
 
-  // 3. Build Gaussian pyramid for current frame (on U16)
-  status = vpiSubmitGaussianPyramidGenerator(filter->vpi_stream,
-                                             VPI_BACKEND_CUDA,
-                                             filter->yImage,
-                                             filter->pyrCurFrame,
+  status = vpiSubmitGaussianPyramidGenerator(filter->vpi_stream, VPI_BACKEND_CUDA,
+                                             filter->yImage, filter->pyrCurFrame,
                                              VPI_BORDER_CLAMP);
   if (status != VPI_SUCCESS) {
     GST_ERROR_OBJECT(filter, "GaussianPyramid failed: %s", vpiStatusGetName(status));
-    vpiImageDestroy(curImage);
-    gst_buffer_unmap(buf, &map_info);
-    return GST_FLOW_ERROR;
+    goto error_destroy_cur;
   }
 
-  vpiImageCreateWrapperPyramidLevel(filter->pyrCurFrame, 0, &filter->harrisGauss);
+  /* ── 5. Harris refresh every 30 frames ──
+   * Harris writes arrPrevPts which LK reads, so we must sync before Harris
+   * and again after before LK. This is the only unavoidable double-sync. ── */
+  if (filter->frameCount % 30 == 0) {
+    /* Sync so pyramid is complete before Harris reads it */
+    vpiStreamSync(filter->vpi_stream);
 
-  
+    /* Recreate harrisGauss wrapper pointing at the current pyramid level */
+    if (filter->harrisGauss) { vpiImageDestroy(filter->harrisGauss); filter->harrisGauss = NULL; }
+    vpiImageCreateWrapperPyramidLevel(filter->pyrCurFrame, 0, &filter->harrisGauss);
 
-
-  //Logic for Harris Edge detection using VPI
-  if(filter->frameCount >= 30){
-    status = vpiSubmitHarrisCornerDetector(filter->vpi_stream,
-                                  VPI_BACKEND_CUDA,
-                                  filter->harris,
-                                  filter->harrisGauss,
-                                  filter->arrCurPts,
-                                  filter->harrisScores,
-                                  &filter->harrisParams);
+    status = vpiSubmitHarrisCornerDetector(filter->vpi_stream, VPI_BACKEND_CUDA,
+                                           filter->harris, filter->harrisGauss,
+                                           filter->arrPrevPts, filter->harrisScores,
+                                           &filter->harrisParams);
     if (status != VPI_SUCCESS) {
-        GST_ERROR_OBJECT(filter, "harris corner detector failed: %s", vpiStatusGetName(status));
-        vpiImageDestroy(curImage);
-        gst_buffer_unmap(buf, &map_info);
-        return GST_FLOW_ERROR;
+      GST_ERROR_OBJECT(filter, "Harris failed: %s", vpiStatusGetName(status));
+      goto error_destroy_cur;
     }
-    filter->frameCount = 0;
 
+    /* Sync so arrPrevPts is populated before LK uses it */
+    vpiStreamSync(filter->vpi_stream);
+
+    VPIArrayData dbg;
+    vpiArrayLockData(filter->arrPrevPts, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &dbg);
+    GST_DEBUG_OBJECT(filter, "Harris detected %d keypoints", *dbg.buffer.aos.sizePointer);
+    vpiArrayUnlock(filter->arrPrevPts);
   }
-  
+  filter->frameCount++;
 
-
-  // 4. Only run optical flow if we have a previous frame
+  /* ── 6-7. Optical flow + warp (only once we have a previous frame) ── */
   if (filter->prevImage != NULL) {
-    filter->frameCount +=1;
-    status = vpiSubmitOpticalFlowPyrLK(filter->vpi_stream,
-                                       VPI_BACKEND_CUDA,
+
+    /* Submit LK — GPU starts tracking while CPU continues below */
+    status = vpiSubmitOpticalFlowPyrLK(filter->vpi_stream, VPI_BACKEND_CUDA,
                                        filter->optflow,
-                                       filter->pyrPrevFrame,
-                                       filter->pyrCurFrame,
-                                       filter->arrPrevPts,
-                                       filter->arrCurPts,
+                                       filter->pyrPrevFrame, filter->pyrCurFrame,
+                                       filter->arrPrevPts,   filter->arrCurPts,
                                        filter->arrStatus,
                                        &filter->lkParams);
     if (status != VPI_SUCCESS) {
       GST_ERROR_OBJECT(filter, "OpticalFlowPyrLK failed: %s", vpiStatusGetName(status));
-      vpiImageDestroy(curImage);
-      gst_buffer_unmap(buf, &map_info);
-      return GST_FLOW_ERROR;
-    } 
+      goto error_destroy_cur;
+    }
 
+    /* ── CPU work while GPU runs LK ──
+     * Build the warp matrix now so it's ready the moment we need it.
+     * This runs in parallel with the GPU optical flow above. ── */
+    double rad         = filter->frameCount * 3 * M_PI / 180.0;
+    double w           = (double)filter->width;
+    double h           = (double)filter->height;
+    double scaleX      = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * h / w);
+    double scaleY      = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * w / h);
+    double aspectScale = fmin_f((float)scaleX, (float)scaleY);
+
+    VPIPerspectiveTransform rotation    = { { cos(rad), -sin(rad), 0.0 },
+                                            { sin(rad),  cos(rad), 0.0 },
+                                            { 0.0,       0.0,      1.0 } };
+    VPIPerspectiveTransform to_center   = { { 1.0, 0.0,  filter->width  / 2.0f },
+                                            { 0.0, 1.0,  filter->height / 2.0f },
+                                            { 0.0, 0.0,  1.0 } };
+    VPIPerspectiveTransform from_center = { { 1.0, 0.0, -filter->width  / 2.0f },
+                                            { 0.0, 1.0, -filter->height / 2.0f },
+                                            { 0.0, 0.0,  1.0 } };
+    VPIPerspectiveTransform scale_mat   = { { aspectScale, 0.0,         0.0 },
+                                            { 0.0,         aspectScale, 0.0 },
+                                            { 0.0,         0.0,         1.0 } };
+    VPIPerspectiveTransform tmp, translate, final_mat;
+    mat3_multiply(tmp,       to_center,  scale_mat);
+    mat3_multiply(translate, tmp,        rotation);
+    mat3_multiply(final_mat, translate,  from_center);
+
+    /* ── Single sync: wait for LK to finish ── */
+    vpiStreamSync(filter->vpi_stream);
+
+   
+
+    /* Transform estimator runs on CPU backend — submit it, then immediately
+     * submit the warp so the GPU can start warping while CPU runs transform ── */
+    status = vpiSubmitTransformEstimator(filter->vpi_stream, VPI_BACKEND_CPU,
+                                         filter->transformPayload,
+                                         filter->arrPrevPts, filter->arrCurPts,
+                                         NULL, filter->transform,
+                                         NULL, &filter->transformParams);
+    if (status != VPI_SUCCESS) {
+      GST_ERROR_OBJECT(filter, "TransformEstimator failed: %s", vpiStatusGetName(status));
+      goto error_destroy_cur;
+    }
+
+    /* Submit warp immediately after — GPU can pipeline this behind the CPU transform ── */
+    status = vpiSubmitPerspectiveWarp(filter->vpi_stream, VPI_BACKEND_CUDA,
+                                      curImage, final_mat, filter->warpedImage,
+                                      NULL, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0);
+    if (status != VPI_SUCCESS) {
+      GST_ERROR_OBJECT(filter, "PerspectiveWarp failed: %s", vpiStatusGetName(status));
+      goto error_destroy_cur;
+    }
+
+    /* Final sync — waits for both transform estimator and warp to finish ── */
+    vpiStreamSync(filter->vpi_stream);
+
+    /* Read homography result */
+    {
+      VPIArrayData data;
+      vpiArrayLockData(filter->transform, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &data);
+      VPIHomographyTransform2D *xform = (VPIHomographyTransform2D *)data.buffer.aos.data;
+      GST_DEBUG_OBJECT(filter, "Homography: [%f %f %f | %f %f %f | %f %f %f]",
+          xform->mat3[0][0], xform->mat3[0][1], xform->mat3[0][2],
+          xform->mat3[1][0], xform->mat3[1][1], xform->mat3[1][2],
+          xform->mat3[2][0], xform->mat3[2][1], xform->mat3[2][2]);
+      vpiArrayUnlock(filter->transform);
+    }
+
+    NvBufSurfaceCopy(filter->warpedSurface, surface);
   }
 
-  // 5. Wait for GPU work to finish
-  vpiStreamSync(filter->vpi_stream);
-
-  // TODO 6: CPU - read arrCurPts/arrPrevPts, fit homography, smooth it
-
-  //Calculate rad from pts
-  
-  double rad = filter->frameCount * 3 * M_PI / 180.0;
-  double w = (double)filter->width;
-  double h = (double)filter->height;
-  double scaleX = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * h / w);
-  double scaleY = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * w / h);
-  double aspectScale = min(scaleX, scaleY);
-
-  VPIPerspectiveTransform rotation = {
-    {cos(rad), -sin(rad), 0.0 },
-    {sin(rad),  cos(rad), 0.0 },
-    {0.0,  0.0, 1.0 }
-  };
-  VPIPerspectiveTransform to_center = {
-    {1.0, 0.0, filter->width/2.0f },
-    {0.0,  1.0, filter->height/2.0f },
-    {0.0,  0.0, 1.0 }
-  };
-  VPIPerspectiveTransform from_center = {
-    {1.0, 0.0, -filter->width/2.0f },
-    {0.0,  1.0, -filter->height/2.0f },
-    {0.0,  0.0, 1.0 }
-  };
-  VPIPerspectiveTransform scale = {
-    {aspectScale, 0.0, 0.0},
-    {0.0,  aspectScale, 0.0},
-    {0.0,  0.0, 1.0 }
-  };
-
-  VPIPerspectiveTransform tmp, translate, final_mat;
-  mat3_multiply(tmp, to_center, scale);
-  mat3_multiply(translate, tmp, rotation);
-  mat3_multiply(final_mat, translate, from_center);
-  
-  //memcpy(filter->transform, tmp, sizeof(VPIPerspectiveTransform));
-  // TODO 7: vpiSubmitPerspectiveWarp() on CUDA
-  // Unfortunately needs a copy buffer? hml
-  
-  status = vpiSubmitPerspectiveWarp(filter->vpi_stream, 
-                                    VPI_BACKEND_CUDA, 
-                                    curImage, 
-                                    final_mat, 
-                                    filter->warpedImage, 
-                                    NULL, 
-                                    VPI_INTERP_LINEAR, 
-                                    VPI_BORDER_ZERO, 
-                                    0);
-  if (status != VPI_SUCCESS) {
-      GST_ERROR_OBJECT(filter, "Perspective warp failed: %s", vpiStatusGetName(status));
-      vpiImageDestroy(curImage);
-      gst_buffer_unmap(buf, &map_info);
-      return GST_FLOW_ERROR;
-  } 
-  
-  
-  // TODO 8: vpiStreamSync() after warp
-  vpiStreamSync(filter->vpi_stream);
-  NvBufSurfaceCopy(filter->warpedSurface, surface);
-  
-  
-  
-
-  // 9. Swap prev <-> cur for next frame
-  if (filter->prevImage != NULL) {
-    vpiImageDestroy(filter->prevImage);
-  }
-  filter->prevImage = curImage;
+  /* ── 8. Advance state: update prevImage, swap pyramids and point arrays ── */
+  if (filter->prevImage) { vpiImageDestroy(filter->prevImage); filter->prevImage = NULL; }
+  filter->prevImage = curImage;  /* takes ownership */
   curImage = NULL;
 
-  VPIPyramid tmpPyr    = filter->pyrPrevFrame;
-  filter->pyrPrevFrame = filter->pyrCurFrame;
-  filter->pyrCurFrame  = tmpPyr;
-
-  VPIArray tmpArr    = filter->arrPrevPts;
-  filter->arrPrevPts = filter->arrCurPts;
-  filter->arrCurPts  = tmpArr;
-
-
+  { VPIPyramid t = filter->pyrPrevFrame; filter->pyrPrevFrame = filter->pyrCurFrame; filter->pyrCurFrame = t; }
+  { VPIArray   t = filter->arrPrevPts;   filter->arrPrevPts   = filter->arrCurPts;   filter->arrCurPts   = t; }
 
   gst_buffer_unmap(buf, &map_info);
   return gst_pad_push(filter->srcpad, buf);
+
+error_destroy_cur:
+  if (curImage) vpiImageDestroy(curImage);
+  gst_buffer_unmap(buf, &map_info);
+  return GST_FLOW_ERROR;
 }
 
 static gboolean

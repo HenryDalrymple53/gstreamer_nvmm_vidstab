@@ -12,7 +12,7 @@
 #include <vpi/algo/PerspectiveWarp.h>
 #include <vpi/algo/ConvertImageFormat.h>
 #include <vpi/algo/HarrisCorners.h>
-
+#include <vpi/algo/TransformEstimator.h>
 G_BEGIN_DECLS
 
 #define GST_TYPE_MYFILTER (gst_my_filter_get_type())
@@ -68,11 +68,21 @@ struct _GstMyFilter
 
   /*warped imgae*/
   VPIImage warpedImage;
-  VPIPerspectiveTransform transform;
 
   NvBufSurface *warpedSurface;
 
-  
+
+  /*TransformEstimator*/
+  VPITransformEstimatorParams transformParams;
+  VPIPayload transformPayload;
+  VPIArray transform;
+  VPIArray arrMatches;
+
+  NvBufSurface *imageSurface;
+  VPIImage curImage;
+
+
+
 };
 
 G_END_DECLS
