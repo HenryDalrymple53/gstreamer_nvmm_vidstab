@@ -122,10 +122,8 @@ gst_my_filter_init (GstMyFilter * filter)
   filter->frameCount       = 0;
   filter->warpedImage      = NULL;
   filter->yImage           = NULL;
-  filter->transform        = NULL;
-  filter->arrMatches       = NULL;
-  filter->transformPayload = NULL;
   filter->warpedSurface    = NULL;
+  filter->refreshHarris = true;
 
   vpiStreamCreate(VPI_BACKEND_CUDA | VPI_BACKEND_CPU, &filter->vpi_stream);
 }
@@ -137,7 +135,6 @@ gst_my_filter_teardown_vpi (GstMyFilter * filter)
   /* Payloads */
   if (filter->optflow)          { vpiPayloadDestroy(filter->optflow);          filter->optflow          = NULL; }
   if (filter->harris)           { vpiPayloadDestroy(filter->harris);           filter->harris           = NULL; }
-  if (filter->transformPayload) { vpiPayloadDestroy(filter->transformPayload); filter->transformPayload = NULL; }
 
   /* Pyramids */
   if (filter->pyrPrevFrame) { vpiPyramidDestroy(filter->pyrPrevFrame); filter->pyrPrevFrame = NULL; }
@@ -148,8 +145,6 @@ gst_my_filter_teardown_vpi (GstMyFilter * filter)
   if (filter->arrCurPts)    { vpiArrayDestroy(filter->arrCurPts);    filter->arrCurPts    = NULL; }
   if (filter->arrStatus)    { vpiArrayDestroy(filter->arrStatus);    filter->arrStatus    = NULL; }
   if (filter->harrisScores) { vpiArrayDestroy(filter->harrisScores); filter->harrisScores = NULL; }
-  if (filter->arrMatches)   { vpiArrayDestroy(filter->arrMatches);   filter->arrMatches   = NULL; }
-  if (filter->transform)    { vpiArrayDestroy(filter->transform);    filter->transform    = NULL; }
 
   /* Images — harrisGauss is a wrapper (pyramid level), destroy before the pyramid */
   if (filter->harrisGauss)  { vpiImageDestroy(filter->harrisGauss);  filter->harrisGauss  = NULL; }
@@ -197,13 +192,11 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
       &filter->pyrCurFrame);
 
   /* Arrays */
-#define MAX_KEYPOINTS 1000
+  #define MAX_KEYPOINTS 1000
   vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0, &filter->arrPrevPts);
   vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0, &filter->arrCurPts);
   vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_U8,           0, &filter->arrStatus);
   vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_U32,          0, &filter->harrisScores);
-  vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_MATCHES,      0, &filter->arrMatches);
-  vpiArrayCreate(1, VPI_ARRAY_TYPE_HOMOGRAPHY_TRANSFORM_2D,  0, &filter->transform);
 
   /* LK optical flow */
   vpiInitOpticalFlowPyrLKParams(VPI_BACKEND_CUDA, &filter->lkParams);
@@ -220,45 +213,9 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
                                 filter->width, filter->height,
                                 &filter->harris);
 
-  /* Transform estimator */
-  vpiInitTransformEstimatorParams(VPI_XFORM_CONSTRAINED_HOMOGRAPHY_2D,
-                                  &filter->transformParams);
-  filter->transformParams.ransacMaxIterations          = 25;
-  filter->transformParams.ransacReprojErrorTolerance   = 3.0f;
-  filter->transformParams.ransacConfidenceLevel        = 0.70f;
-  filter->transformParams.ransacSeed                   = 0;
 
-  filter->transformParams.solverMaxIterations          = 1;
 
-  filter->transformParams.maxRefinementIterations      = 2;      // 10 is overkill
-
-  /* Constrained homography — rigid motion only (translation + rotation, no scale/shear) */
-  filter->transformParams.xfcfg.constrainedHomography2D.isAffine         = 1;
-  filter->transformParams.xfcfg.constrainedHomography2D.isIsotropicScale = 1;
-
-  /* Lock scale to 1.0 (no zoom) */
-  filter->transformParams.xfcfg.constrainedHomography2D.minXScale = 1.0f;
-  filter->transformParams.xfcfg.constrainedHomography2D.maxXScale = 1.0f;
-  filter->transformParams.xfcfg.constrainedHomography2D.minYScale = 1.0f;
-  filter->transformParams.xfcfg.constrainedHomography2D.maxYScale = 1.0f;
-
-  /* Clamp rotation to ±5 degrees — larger rotations are likely noise */
-  filter->transformParams.xfcfg.constrainedHomography2D.minRotation = -5.0f * M_PI / 180.0f;
-  filter->transformParams.xfcfg.constrainedHomography2D.maxRotation =  5.0f * M_PI / 180.0f;
-
-  /* Clamp translation to ±100px — adjust to your expected jitter range */
-  filter->transformParams.xfcfg.constrainedHomography2D.minXTranslation = -10.0f;
-  filter->transformParams.xfcfg.constrainedHomography2D.maxXTranslation =  10.0f;
-  filter->transformParams.xfcfg.constrainedHomography2D.minYTranslation = -10.0f;
-  filter->transformParams.xfcfg.constrainedHomography2D.maxYTranslation =  10.0f;
-  VPIStatus status = vpiCreateTransformEstimator(VPI_BACKEND_CPU,
-                                                 MAX_KEYPOINTS,
-                                                 &filter->transformPayload);
-  if (status != VPI_SUCCESS) {
-    GST_ERROR_OBJECT(filter, "Create Transform failed: %s", vpiStatusGetName(status));
-    return FALSE;
-  }
-
+  
   /* Warped output surface + VPI wrapper */
   NvBufSurfaceCreateParams params = {0};
   params.gpuId       = 0;
@@ -418,7 +375,7 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   /* ── 5. Harris refresh every 30 frames ──
    * Harris writes arrPrevPts which LK reads, so we must sync before Harris
    * and again after before LK. This is the only unavoidable double-sync. ── */
-  if (filter->frameCount % 30 == 0) {
+  if (filter->refreshHarris) {
     /* Sync so pyramid is complete before Harris reads it */
     vpiStreamSync(filter->vpi_stream);
 
@@ -433,6 +390,11 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     if (status != VPI_SUCCESS) {
       GST_ERROR_OBJECT(filter, "Harris failed: %s", vpiStatusGetName(status));
       goto error_destroy_cur;
+
+    VPIArray   t = filter->arrPrevPts;   
+    filter->arrPrevPts   = filter->arrCurPts;   
+    filter->arrCurPts   = t;
+
     }
 
     /* Sync so arrPrevPts is populated before LK uses it */
@@ -442,6 +404,7 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     vpiArrayLockData(filter->arrPrevPts, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &dbg);
     GST_DEBUG_OBJECT(filter, "Harris detected %d keypoints", *dbg.buffer.aos.sizePointer);
     vpiArrayUnlock(filter->arrPrevPts);
+    filter->refreshHarris = false;
   }
   filter->frameCount++;
 
@@ -492,17 +455,7 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
 
    
 
-    /* Transform estimator runs on CPU backend — submit it, then immediately
-     * submit the warp so the GPU can start warping while CPU runs transform ── */
-    status = vpiSubmitTransformEstimator(filter->vpi_stream, VPI_BACKEND_CPU,
-                                         filter->transformPayload,
-                                         filter->arrPrevPts, filter->arrCurPts,
-                                         NULL, filter->transform,
-                                         NULL, &filter->transformParams);
-    if (status != VPI_SUCCESS) {
-      GST_ERROR_OBJECT(filter, "TransformEstimator failed: %s", vpiStatusGetName(status));
-      goto error_destroy_cur;
-    }
+
 
     /* Submit warp immediately after — GPU can pipeline this behind the CPU transform ── */
     status = vpiSubmitPerspectiveWarp(filter->vpi_stream, VPI_BACKEND_CUDA,
@@ -516,17 +469,7 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     /* Final sync — waits for both transform estimator and warp to finish ── */
     vpiStreamSync(filter->vpi_stream);
 
-    /* Read homography result */
-    {
-      VPIArrayData data;
-      vpiArrayLockData(filter->transform, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &data);
-      VPIHomographyTransform2D *xform = (VPIHomographyTransform2D *)data.buffer.aos.data;
-      GST_DEBUG_OBJECT(filter, "Homography: [%f %f %f | %f %f %f | %f %f %f]",
-          xform->mat3[0][0], xform->mat3[0][1], xform->mat3[0][2],
-          xform->mat3[1][0], xform->mat3[1][1], xform->mat3[1][2],
-          xform->mat3[2][0], xform->mat3[2][1], xform->mat3[2][2]);
-      vpiArrayUnlock(filter->transform);
-    }
+
 
     NvBufSurfaceCopy(filter->warpedSurface, surface);
   }
@@ -537,7 +480,6 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   curImage = NULL;
 
   { VPIPyramid t = filter->pyrPrevFrame; filter->pyrPrevFrame = filter->pyrCurFrame; filter->pyrCurFrame = t; }
-  { VPIArray   t = filter->arrPrevPts;   filter->arrPrevPts   = filter->arrCurPts;   filter->arrCurPts   = t; }
 
   gst_buffer_unmap(buf, &map_info);
   return gst_pad_push(filter->srcpad, buf);

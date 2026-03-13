@@ -51,6 +51,7 @@ struct _GstMyFilter
   VPIPayload harris;
   VPIHarrisCornerDetectorParams harrisParams;
   uint64_t frameCount;
+  bool refreshHarris;
 
   /* Optical flow payload */
   VPIPayload optflow;
@@ -72,11 +73,7 @@ struct _GstMyFilter
   NvBufSurface *warpedSurface;
 
 
-  /*TransformEstimator*/
-  VPITransformEstimatorParams transformParams;
-  VPIPayload transformPayload;
-  VPIArray transform;
-  VPIArray arrMatches;
+
 
   NvBufSurface *imageSurface;
   VPIImage curImage;
