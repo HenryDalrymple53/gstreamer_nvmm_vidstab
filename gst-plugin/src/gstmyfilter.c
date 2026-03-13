@@ -124,6 +124,9 @@ gst_my_filter_init (GstMyFilter * filter)
   filter->yImage           = NULL;
   filter->warpedSurface    = NULL;
   filter->refreshHarris = true;
+  filter->cumX = 0.0;
+  filter->cumY = 0.0;
+
 
   vpiStreamCreate(VPI_BACKEND_CUDA | VPI_BACKEND_CPU, &filter->vpi_stream);
 }
@@ -422,6 +425,46 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
       GST_ERROR_OBJECT(filter, "OpticalFlowPyrLK failed: %s", vpiStatusGetName(status));
       goto error_destroy_cur;
     }
+    vpiStreamSync(filter->vpi_stream);
+    VPIArrayData prevPts;
+    VPIArrayData curPts;
+    VPIArrayData status;
+
+    vpiArrayLockData(filter->arrPrevPts, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS,&prevPts);
+    vpiArrayLockData(filter->arrCurPts, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS,&curPts);
+    vpiArrayLockData(filter->arrStatus, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS,&status);
+
+    VPIKeypointF32 *prevPtsArr = (VPIKeypointF32 *)prevPts.buffer.aos.data;
+    VPIKeypointF32 *curPtsArr = (VPIKeypointF32 *)curPts.buffer.aos.data;
+    uint8_t *statusArr = (uint8_t *)status.buffer.aos.data;
+    int n = *curPts.buffer.aos.sizePointer;
+    int numGoodPts = 0;
+    float xDif = 0.0f;
+    float yDif = 0.0f;
+
+    for(int i = 0; i < n; i++){
+      if(statusArr[i]==0){
+        xDif += (curPtsArr[i].x - prevPtsArr[i].x);
+        yDif += (curPtsArr[i].y - prevPtsArr[i].y);
+        numGoodPts++;
+      }
+      
+    }
+
+    if (numGoodPts > 0) {
+        xDif /= numGoodPts;
+        yDif /= numGoodPts;
+    } else {
+        xDif = 0.0f;
+        yDif = 0.0f;
+    }
+    filter->cumX = filter->cumX * 0.95f + xDif;
+    filter->cumY = filter->cumY * 0.95f + yDif;
+
+    vpiArrayUnlock(filter->arrPrevPts);
+    vpiArrayUnlock(filter->arrCurPts);
+    vpiArrayUnlock(filter->arrStatus);
+
 
     /* ── CPU work while GPU runs LK ──
      * Build the warp matrix now so it's ready the moment we need it.
@@ -432,9 +475,11 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     double scaleX      = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * h / w);
     double scaleY      = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * w / h);
     double aspectScale = fmin_f((float)scaleX, (float)scaleY);
+    GST_DEBUG_OBJECT(filter, "xDif: %f \t yDif: %f", -filter->cumX, -filter->cumY);
 
-    VPIPerspectiveTransform rotation    = { { cos(rad), -sin(rad), 0.0 },
-                                            { sin(rad),  cos(rad), 0.0 },
+
+    VPIPerspectiveTransform rotation    = { { 1.0, 0.0, -filter->cumX },
+                                            { 0.0,  1.0, -filter->cumY },
                                             { 0.0,       0.0,      1.0 } };
     VPIPerspectiveTransform to_center   = { { 1.0, 0.0,  filter->width  / 2.0f },
                                             { 0.0, 1.0,  filter->height / 2.0f },
@@ -442,8 +487,8 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     VPIPerspectiveTransform from_center = { { 1.0, 0.0, -filter->width  / 2.0f },
                                             { 0.0, 1.0, -filter->height / 2.0f },
                                             { 0.0, 0.0,  1.0 } };
-    VPIPerspectiveTransform scale_mat   = { { aspectScale, 0.0,         0.0 },
-                                            { 0.0,         aspectScale, 0.0 },
+    VPIPerspectiveTransform scale_mat   = { { 1.0, 0.0,         0.0 },
+                                            { 0.0,         1.0, 0.0 },
                                             { 0.0,         0.0,         1.0 } };
     VPIPerspectiveTransform tmp, translate, final_mat;
     mat3_multiply(tmp,       to_center,  scale_mat);
@@ -458,13 +503,10 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
 
 
     /* Submit warp immediately after — GPU can pipeline this behind the CPU transform ── */
-    status = vpiSubmitPerspectiveWarp(filter->vpi_stream, VPI_BACKEND_CUDA,
+    vpiSubmitPerspectiveWarp(filter->vpi_stream, VPI_BACKEND_CUDA,
                                       curImage, final_mat, filter->warpedImage,
                                       NULL, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0);
-    if (status != VPI_SUCCESS) {
-      GST_ERROR_OBJECT(filter, "PerspectiveWarp failed: %s", vpiStatusGetName(status));
-      goto error_destroy_cur;
-    }
+        
 
     /* Final sync — waits for both transform estimator and warp to finish ── */
     vpiStreamSync(filter->vpi_stream);

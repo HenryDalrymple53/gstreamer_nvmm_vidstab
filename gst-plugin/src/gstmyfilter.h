@@ -78,6 +78,9 @@ struct _GstMyFilter
   NvBufSurface *imageSurface;
   VPIImage curImage;
 
+  float cumX;
+  float cumY;
+
 
 
 };
