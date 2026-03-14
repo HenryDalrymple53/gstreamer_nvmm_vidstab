@@ -1,5 +1,5 @@
 GST_DEBUG=myfilter:5 gst-launch-1.0 \
-  filesrc location=left_drive.mp4 ! \
+  filesrc location=drive_left_long.mp4 ! \
   qtdemux ! \
   h264parse ! \
   nvv4l2decoder ! \

@@ -211,7 +211,11 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
 
   /* Harris corner detector */
   vpiInitHarrisCornerDetectorParams(&filter->harrisParams);
-  filter->harrisParams.sensitivity = 0.01;
+  filter->harrisParams.gradientSize    = 7;     /* largest — captures more gradient info */
+filter->harrisParams.blockSize       = 7;     /* largest — more robust corner response */
+filter->harrisParams.strengthThresh  = 5.0f;  /* no threshold — keep all corners */
+filter->harrisParams.sensitivity     = 0.01f; /* very low — keeps weak corners too */
+filter->harrisParams.minNMSDistance  = 1;     /* tight — allows dense point clusters */
   vpiCreateHarrisCornerDetector(VPI_BACKEND_CUDA,
                                 filter->width, filter->height,
                                 &filter->harris);
@@ -475,7 +479,7 @@ gst_my_filter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     double scaleX      = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * h / w);
     double scaleY      = 1.0 / (fabs(cos(rad)) + fabs(sin(rad)) * w / h);
     double aspectScale = fmin_f((float)scaleX, (float)scaleY);
-    GST_DEBUG_OBJECT(filter, "xDif: %f \t yDif: %f", -filter->cumX, -filter->cumY);
+    //GST_DEBUG_OBJECT(filter, "xDif: %f \t yDif: %f", -filter->cumX, -filter->cumY);
 
 
     VPIPerspectiveTransform rotation    = { { 1.0, 0.0, -filter->cumX },
