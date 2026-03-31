@@ -195,7 +195,7 @@ gst_my_filter_setup_vpi (GstMyFilter * filter)
       &filter->pyrCurFrame);
 
   /* Arrays */
-  #define MAX_KEYPOINTS 1000
+  #define MAX_KEYPOINTS 100
   vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0, &filter->arrPrevPts);
   vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_KEYPOINT_F32, 0, &filter->arrCurPts);
   vpiArrayCreate(MAX_KEYPOINTS, VPI_ARRAY_TYPE_U8,           0, &filter->arrStatus);
